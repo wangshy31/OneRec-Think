@@ -22,6 +22,44 @@ def extract_sid_from_text(text):
     return text.strip()
 
 
+class TrieNode:
+    """A node in the prefix trie for constrained decoding."""
+    __slots__ = ['children', 'is_end']
+
+    def __init__(self):
+        self.children = {}   # token_id -> TrieNode
+        self.is_end = False  # whether this node marks the end of a valid SID
+
+
+def build_prefix_trie(sid_token_sequences):
+    """Build a proper prefix trie from SID token sequences.
+    
+    Unlike the position-based bigram approach, this trie tracks the full
+    prefix path so that only actually valid SID combinations are allowed
+    during constrained decoding.
+    """
+    root = TrieNode()
+    for seq in sid_token_sequences:
+        node = root
+        for token_id in seq:
+            if token_id not in node.children:
+                node.children[token_id] = TrieNode()
+            node = node.children[token_id]
+        node.is_end = True
+    return root
+
+
+def trie_to_dict(root):
+    """Serialize a TrieNode tree to a plain dict for pickling.
+    
+    Format: each node is {'c': {token_id: child_node_dict, ...}, 'e': bool}
+    """
+    result = {'c': {}, 'e': root.is_end}
+    for token_id, child in root.children.items():
+        result['c'][token_id] = trie_to_dict(child)
+    return result
+
+
 def build_global_trie(test_parquet_file, model_path, output_file):
     print(f"Loading test data from: {test_parquet_file}")
     df = pd.read_parquet(test_parquet_file)
@@ -53,53 +91,36 @@ def build_global_trie(test_parquet_file, model_path, output_file):
     
     print(f"Converted {len(sid_token_sequences)} SIDs to token sequences")
 
-    from collections import defaultdict
-    exact_trie = defaultdict(lambda: defaultdict(set))
+    # ----- FIX: Build a proper prefix trie instead of position-based bigram -----
+    print("Building prefix trie...")
+    trie_root = build_prefix_trie(sid_token_sequences)
+    prefix_trie_dict = trie_to_dict(trie_root)
 
     max_length = max(len(seq) for seq in sid_token_sequences) if sid_token_sequences else 0
     print(f"Maximum SID token length: {max_length}")
-
-    for seq in sid_token_sequences:
-        for pos in range(len(seq)):
-            current_token = seq[pos]
-            if pos + 1 < len(seq):
-                next_token = seq[pos + 1]
-                exact_trie[pos][current_token].add(next_token)
-            else:
-                eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-                exact_trie[pos][current_token].add(eos_id)
-
-    final_exact_trie = {}
-    for pos in exact_trie:
-        final_exact_trie[pos] = {}
-        for token_id in exact_trie[pos]:
-            final_exact_trie[pos][token_id] = list(exact_trie[pos][token_id])
     
-    print(f"Built exact trie tree:")
+    print(f"Built prefix trie:")
     print(f"  Total unique SIDs: {len(valid_sids)}")
     print(f"  Search space size: {len(valid_sids):,} (exact match only)")
     print(f"  Trie depth: {max_length}")
-    
-    for pos in range(min(6, max_length)):
-        num_tokens = len(final_exact_trie.get(pos, {}))
-        print(f"  Position {pos}: {num_tokens} possible tokens")
+    print(f"  Root children (first-level tokens): {len(prefix_trie_dict['c'])}")
 
     trie_data = {
-        'exact_trie': final_exact_trie,
+        'prefix_trie': prefix_trie_dict,
         'valid_sids': valid_sids,
         'valid_sid_tokens': sid_token_sequences,
         'tokenizer_name': model_path,
         'total_samples': len(df),
         'search_space_size': len(valid_sids),
         'max_length': max_length,
-        'trie_type': 'exact'
+        'trie_type': 'prefix'
     }
     
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'wb') as f:
         pickle.dump(trie_data, f)
     
-    print(f"Exact trie saved to: {output_file}")
+    print(f"Prefix trie saved to: {output_file}")
     return trie_data
 
 

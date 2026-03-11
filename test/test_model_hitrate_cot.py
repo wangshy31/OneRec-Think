@@ -266,7 +266,15 @@ class ParquetTestDataset(Dataset):
         }
     
     def get_prefix_allowed_tokens_fn(self, tokenizer, global_trie_file=None):
-        """Create prefix allowed tokens function for SID constrained generation based on exact trie"""
+        """Create prefix allowed tokens function for SID constrained generation based on prefix trie.
+        
+        FIX: Uses a proper prefix trie instead of position-based bigram table.
+        The old implementation used trie[pos][token] -> {next_tokens}, which only
+        considered the position and last token to determine allowed continuations.
+        This ignored the full generation path and could produce invalid SID
+        combinations. The new implementation walks the trie along the complete
+        generated token sequence to ensure only valid SIDs are produced.
+        """
         
         if not global_trie_file:
             raise ValueError("Global trie file path must be provided")
@@ -274,31 +282,28 @@ class ParquetTestDataset(Dataset):
         if not os.path.exists(global_trie_file):
             raise FileNotFoundError(f"Global trie file not found: {global_trie_file}. Please run precompute_global_trie.py first.")
         
-        # Load pre-computed exact trie
-        self.logger.info(f"Loading pre-computed exact trie from: {global_trie_file}")
+        # Load pre-computed prefix trie
+        self.logger.info(f"Loading pre-computed prefix trie from: {global_trie_file}")
         import pickle
         with open(global_trie_file, 'rb') as f:
             trie_data = pickle.load(f)
         
-        # Verify this is an exact trie
+        # Verify this is a prefix trie
         trie_type = trie_data.get('trie_type', None)
-        if trie_type != 'exact':
-            raise ValueError(f"Expected exact trie file, but got trie_type='{trie_type}'. Please regenerate the trie file.")
+        if trie_type != 'prefix':
+            raise ValueError(f"Expected prefix trie file, but got trie_type='{trie_type}'. Please regenerate the trie file with the updated precompute_global_trie.py.")
         
-        # Load exact trie structure
-        allowed_tokens = trie_data['exact_trie']
+        # Load prefix trie structure
+        prefix_trie = trie_data['prefix_trie']
         valid_sids = trie_data['valid_sids']
         search_space_size = trie_data.get('search_space_size', 0)
         max_length = trie_data.get('max_length', 0)
         
-        self.logger.info(f"Loaded exact trie for CoT:")
+        self.logger.info(f"Loaded prefix trie for CoT:")
         self.logger.info(f"  Total unique SIDs: {len(valid_sids)}")
         self.logger.info(f"  Search space size: {search_space_size:,} (exact match only)")
         self.logger.info(f"  Trie depth: {max_length}")
-        
-        for pos in range(min(6, max_length)):
-            num_tokens = len(allowed_tokens.get(pos, {}))
-            self.logger.info(f"  Position {pos}: {num_tokens} possible tokens")
+        self.logger.info(f"  Root children (first-level tokens): {len(prefix_trie['c'])}")
         
         # Get "</think>" separator with newline (to match our prompt format)
         sep = tokenizer("</think>\n", add_special_tokens=False)["input_ids"]
@@ -318,41 +323,46 @@ class ParquetTestDataset(Dataset):
             return None
         
         def prefix_allowed_tokens_fn(batch_id, sentence):
-            """Return allowed tokens based on current generation position using exact trie"""
+            """Return allowed tokens based on current generation position using prefix trie.
+            
+            Walks the trie along the full generated SID token path to determine
+            valid continuations, ensuring only actually valid SIDs can be produced.
+            """
             sentence = sentence.tolist()
             
-            # Find "</think>" position
+            # Find "</think>\n" position
             pos = find_last_sublist(sentence, sep)
             if pos is None:
                 # Before "</think>", allow all tokens
                 return list(tokenizer.get_vocab().values())
             
-            # Calculate position after "</think>" - directly apply SID constraints
+            # Calculate position after "</think>\n" - directly apply SID constraints
             pos_after_sep = pos + len(sep)
             generated_after_sep = sentence[pos_after_sep:]
-            sid_pos = len(generated_after_sep)
             
-            # Use exact trie: check what tokens are allowed at this SID position
-            if sid_pos == 0:
-                # First SID token position - should be <|sid_begin|>
-                if 0 in allowed_tokens:
-                    allowed = list(allowed_tokens[0].keys())
-                    return allowed
+            # Walk the prefix trie following the actual generated SID path
+            node = prefix_trie
+            for tok in generated_after_sep:
+                if tok in node['c']:
+                    node = node['c'][tok]
                 else:
-                    # Allow all tokens if trie is not properly set up
-                    return list(tokenizer.get_vocab().values())
+                    # Generated path is invalid; force EOS
+                    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+                    return [eos_id]
+            
+            # Return all valid continuations from this node
+            if node['c']:
+                allowed = list(node['c'].keys())
+                # If this node also marks end of a valid SID, allow EOS too
+                if node['e']:
+                    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+                    if eos_id not in allowed:
+                        allowed.append(eos_id)
+                return allowed
             else:
-                # Look up what's allowed based on previous SID tokens
-                if sid_pos > 0 and len(generated_after_sep) >= sid_pos:
-                    prev_token = generated_after_sep[sid_pos - 1]
-                    prev_pos = sid_pos - 1
-                    
-                    if prev_pos in allowed_tokens and prev_token in allowed_tokens[prev_pos]:
-                        allowed = allowed_tokens[prev_pos][prev_token]
-                        return allowed
-                
-                # Fallback to allow all tokens if no valid continuation found
-                return list(tokenizer.get_vocab().values())
+                # Leaf node: SID is complete, return EOS
+                eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+                return [eos_id]
         
         return prefix_allowed_tokens_fn
 
