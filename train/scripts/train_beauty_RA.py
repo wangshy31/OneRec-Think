@@ -81,12 +81,36 @@ def prepare_chat_dataset(data_path, sample_size=None, local_rank=0):
 def tokenize_function(examples, tokenizer):
     tokenized = tokenizer(
         examples['text'],
-        padding='longest',
+        # Pad only in the collator:
+        # padding added here would end up in labels (as pad_token_id) because the collator cannot tell it apart.
+        padding=False,
         truncation=True,
         max_length=4096,
         add_special_tokens=True,
         return_attention_mask=True,
     )
+
+    user_start_tokens = tokenizer.encode("<|im_start|>user", add_special_tokens=False)
+    m = len(user_start_tokens)
+
+    all_labels = []
+
+    for input_ids in tokenized['input_ids']:
+        n = len(input_ids)
+        labels = input_ids.copy()
+        start = -1
+        for i in range(n - m + 1):
+            if input_ids[i: i + m] == user_start_tokens:
+                start = i
+                break
+
+        if start != -1:
+            labels[:start] = [-100] * start
+        else:
+            labels = [-100] * n
+        all_labels.append(labels)
+
+    tokenized['labels'] = all_labels
     return tokenized
 
 def get_special_tokens():
@@ -108,48 +132,32 @@ class CustomDataCollator:
         self.mlm = mlm
         
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        input_ids = [feature["input_ids"] for feature in features]
-        attention_mask = [feature["attention_mask"] for feature in features]
 
-        max_length = max(len(ids) for ids in input_ids)
+        max_length = max(len(feature["input_ids"]) for feature in features)
 
         padded_input_ids = []
         padded_attention_mask = []
-        labels = []
+        padded_labels = []
 
-        for i, (ids, mask) in enumerate(zip(input_ids, attention_mask)):
-            padding_length = max_length - len(ids)
-            padded_ids = ids + [self.tokenizer.pad_token_id] * padding_length
-            padded_mask = mask + [0] * padding_length
+        for feature in features:
 
-            label = padded_ids.copy()
+            input_ids = feature["input_ids"]
+            attention_mask = feature["attention_mask"]
+            label = feature["labels"]
 
-            text = self.tokenizer.decode(ids, skip_special_tokens=False)
-            user_start_pos = text.find("<|im_start|>user")
-
-            if user_start_pos != -1:
-                user_start_tokens = self.tokenizer.encode("<|im_start|>user", add_special_tokens=False)
-
-                for j in range(len(ids) - len(user_start_tokens) + 1):
-                    if ids[j:j+len(user_start_tokens)] == user_start_tokens:
-                        for k in range(j):
-                            label[k] = -100
-                        break
-                else:
-                    for k in range(len(label)):
-                        label[k] = -100
-            else:
-                for k in range(len(label)):
-                    label[k] = -100
+            pad_len = max_length - len(input_ids)
+            padded_ids = input_ids + [self.tokenizer.pad_token_id] * pad_len
+            padded_mask = attention_mask + [0] * pad_len
+            padded_label = label + [-100] * pad_len
 
             padded_input_ids.append(padded_ids)
             padded_attention_mask.append(padded_mask)
-            labels.append(label)
-        
+            padded_labels.append(padded_label)
+
         return {
             "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(padded_attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
         }
 
 
