@@ -29,7 +29,7 @@ class ModelArguments:
     lora_alpha: int = field(default=64, metadata={"help": "LoRA alpha"})
     lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
     lora_target_modules: str = field(
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj", 
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
         metadata={"help": "LoRA target modules"}
     )
 
@@ -53,9 +53,9 @@ def prepare_chat_dataset(data_path, sample_size=None, local_rank=0):
         data_pq = data_pq.head(sample_size)
 
     texts = []
-    
+
     system_message = "You are a professional recommendation expert who needs to recommend the next possible purchase for users based on their purchase history. Please predict the most likely next product that the user will purchase based on the user's historical purchase information."
-    
+
     for _, row in data_pq.iterrows():
         assistant_content = f"<think>\n\n</think>\n{row['groundtruth']}"
 
@@ -67,7 +67,7 @@ def prepare_chat_dataset(data_path, sample_size=None, local_rank=0):
 {assistant_content}<|im_end|>
 """
         texts.append(formatted_text)
-    
+
     if local_rank == 0:
         print(f"Total texts: {len(texts)}")
 
@@ -77,7 +77,7 @@ def prepare_chat_dataset(data_path, sample_size=None, local_rank=0):
             print(f"  [{i}] Text: {text[:300]}...")
             print(f"      (Note: Loss calculated from <|im_start|>user onwards)")
             print()
-    
+
     dataset_dict = {
         'text': texts
     }
@@ -87,12 +87,36 @@ def prepare_chat_dataset(data_path, sample_size=None, local_rank=0):
 def tokenize_function(examples, tokenizer):
     tokenized = tokenizer(
         examples['text'],
-        padding='longest',
+        # Pad only in the collator:
+        # padding added here would end up in labels (as pad_token_id) because the collator cannot tell it apart.
+        padding=False,
         truncation=True,
         max_length=4096,
         add_special_tokens=True,
         return_attention_mask=True,
     )
+
+    user_start_tokens = tokenizer.encode("<|im_start|>user", add_special_tokens=False)
+    m = len(user_start_tokens)
+
+    all_labels = []
+
+    for input_ids in tokenized['input_ids']:
+        n = len(input_ids)
+        labels = input_ids.copy()
+        start = -1
+        for i in range(n - m + 1):
+            if input_ids[i: i + m] == user_start_tokens:
+                start = i
+                break
+
+        if start != -1:
+            labels[:start] = [-100] * start
+        else:
+            labels = [-100] * n
+        all_labels.append(labels)
+
+    tokenized['labels'] = all_labels
     return tokenized
 
 def get_special_tokens():
@@ -105,57 +129,41 @@ def get_special_tokens():
     for prefix in ['s_a', 's_b', 's_c', 's_d']:
         for i in range(max_range):
             special_tokens.append(f'<{prefix}_{i}>')
-    
+
     return special_tokens
 
 class CustomDataCollator:
     def __init__(self, tokenizer, mlm=False):
         self.tokenizer = tokenizer
         self.mlm = mlm
-        
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        input_ids = [feature["input_ids"] for feature in features]
-        attention_mask = [feature["attention_mask"] for feature in features]
 
-        max_length = max(len(ids) for ids in input_ids)
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+        max_length = max(len(feature["input_ids"]) for feature in features)
 
         padded_input_ids = []
         padded_attention_mask = []
-        labels = []
+        padded_labels = []
 
-        for i, (ids, mask) in enumerate(zip(input_ids, attention_mask)):
-            padding_length = max_length - len(ids)
-            padded_ids = ids + [self.tokenizer.pad_token_id] * padding_length
-            padded_mask = mask + [0] * padding_length
+        for feature in features:
 
-            label = padded_ids.copy()
+            input_ids = feature["input_ids"]
+            attention_mask = feature["attention_mask"]
+            label = feature["labels"]
 
-            text = self.tokenizer.decode(ids, skip_special_tokens=False)
-            user_start_pos = text.find("<|im_start|>user")
-
-            if user_start_pos != -1:
-                user_start_tokens = self.tokenizer.encode("<|im_start|>user", add_special_tokens=False)
-
-                for j in range(len(ids) - len(user_start_tokens) + 1):
-                    if ids[j:j+len(user_start_tokens)] == user_start_tokens:
-                        for k in range(j):
-                            label[k] = -100
-                        break
-                else:
-                    for k in range(len(label)):
-                        label[k] = -100
-            else:
-                for k in range(len(label)):
-                    label[k] = -100
+            pad_len = max_length - len(input_ids)
+            padded_ids = input_ids + [self.tokenizer.pad_token_id] * pad_len
+            padded_mask = attention_mask + [0] * pad_len
+            padded_label = label + [-100] * pad_len
 
             padded_input_ids.append(padded_ids)
             padded_attention_mask.append(padded_mask)
-            labels.append(label)
-        
+            padded_labels.append(padded_label)
+
         return {
             "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(padded_attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
         }
 
 
@@ -192,7 +200,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(str(model_dir))
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
     tokenizer.pad_token = tokenizer.eos_token
-    
+
     if training_args.local_rank == 0:
         print(f"Model loaded successfully")
         print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
@@ -209,7 +217,7 @@ if __name__ == "__main__":
         if token_id != tokenizer.unk_token_id:
             valid_special_token_ids.append(token_id)
             valid_special_tokens.append(special_tokens[i])
-    
+
     if training_args.local_rank == 0:
         print(f"Valid special tokens: {len(valid_special_token_ids)}")
         print(f"First 10 valid special tokens: {valid_special_tokens[:10]}")
@@ -228,7 +236,7 @@ if __name__ == "__main__":
                 'embed_tokens': valid_special_token_ids,
             }
         )
-        
+
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
@@ -291,7 +299,7 @@ if __name__ == "__main__":
         print(f"\\nTrainer eval_strategy: {trainer.args.eval_strategy}")
         print(f"Trainer has eval_dataset: {trainer.eval_dataset is not None}")
         print(f"Eval dataset size: {len(trainer.eval_dataset) if trainer.eval_dataset else 0}")
-    
+
     if training_args.local_rank == 0:
         print("\\nStarting training...")
     trainer.train()
